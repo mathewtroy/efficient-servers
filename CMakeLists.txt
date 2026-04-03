@@ -28,3 +28,17 @@ target_link_libraries(efficient_servers PRIVATE
         protobuf::libprotobuf
         pthread
 )
+
+add_executable(decode_responses
+        decode_responses.cpp
+        ${PROTO_SRCS}
+)
+
+target_include_directories(decode_responses PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${Protobuf_INCLUDE_DIRS}
+)
+
+target_link_libraries(decode_responses PRIVATE
+        protobuf::libprotobuf
+)
