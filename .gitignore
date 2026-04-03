@@ -24,6 +24,7 @@ proto/*.pb.h
 *.a
 *.out
 *.exe
+*.bin
 
 # OS files
 .DS_Store
