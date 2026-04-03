@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "cz.cvut.fel.esw.server.proto";
+
+message Request {
+  oneof msg {
+    Walk walk = 1;
+    OneToOne oneToOne = 2;
+    OneToAll oneToAll = 3;
+    Reset reset = 4;
+  }
+}
+
+message Walk {
+  repeated Location locations = 1;
+  repeated uint32 lengths = 2;
+}
+
+message OneToOne {
+  Location origin = 1;
+  Location destination = 2;
+}
+
+message OneToAll {
+  Location origin = 1;
+}
+
+message Reset {}
+
+message Location {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+message Response {
+  enum Status {
+    OK = 0;
+    ERROR = 1;
+  }
+
+  Status status = 1;
+  string errMsg = 2;
+  uint64 shortest_path_length = 3;
+  uint64 total_length = 4;
+}
