@@ -1,0 +1,29 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# CLion / IntelliJ
+.idea/
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+compile_commands.json
+
+# Generated protobuf files
+proto/*.pb.cc
+proto/*.pb.h
+
+# Binaries
+*.o
+*.obj
+*.so
+*.a
+*.out
+*.exe
+
+# OS files
+.DS_Store
