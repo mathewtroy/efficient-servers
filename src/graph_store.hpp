@@ -1,6 +1,5 @@
 #pragma once
 
-#include "dijkstra.hpp"
 #include "server.pb.h"
 #include "types.hpp"
 
@@ -31,7 +30,8 @@ private:
     static bool points_match(const Point& a, const Point& b);
     static std::pair<int32_t, int32_t> cell_of(const Point& point);
 
-    Dijkstra::Graph build_graph_snapshot_locked() const;
+    bool dijkstra_one_to_one_locked(uint32_t source, uint32_t target, uint64_t& result) const;
+    uint64_t dijkstra_one_to_all_locked(uint32_t source) const;
 
     mutable std::shared_mutex mutex_;
     std::vector<Node> nodes_;

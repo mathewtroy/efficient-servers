@@ -5,7 +5,7 @@
 #include <functional>
 
 constexpr int32_t LOCATION_MERGE_RADIUS_MM = 500;
-constexpr int32_t GRID_CELL_SIZE_MM = 500;
+constexpr int32_t GRID_CELL_SIZE_MM = 1000;
 constexpr uint64_t INF_DISTANCE = (1ULL << 62);
 
 struct Point {

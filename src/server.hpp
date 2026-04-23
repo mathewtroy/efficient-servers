@@ -1,6 +1,9 @@
 #pragma once
 
 #include "graph_store.hpp"
+#include "thread_pool.hpp"
+
+#include <thread>
 
 class Server {
 public:
@@ -12,4 +15,8 @@ private:
 
     int port_;
     GraphStore graph_store_;
+
+    ThreadPool thread_pool_{
+        std::max(4u, std::thread::hardware_concurrency())
+    };
 };

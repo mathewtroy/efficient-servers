@@ -1,8 +1,10 @@
 #include "graph_store.hpp"
 
 #include <mutex>
+#include <queue>
 #include <utility>
 #include <vector>
+
 
 void GraphStore::reset() {
     std::unique_lock lock(mutex_);
@@ -91,23 +93,81 @@ bool GraphStore::add_walk(const Walk& walk) {
     return true;
 }
 
-Dijkstra::Graph GraphStore::build_graph_snapshot_locked() const {
-    Dijkstra::Graph graph(nodes_.size());
+bool GraphStore::dijkstra_one_to_one_locked(uint32_t source,
+                                             uint32_t target,
+                                             uint64_t& result) const {
+    using QueueItem = std::pair<uint64_t, uint32_t>;
+    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<>> pq;
 
-    for (std::size_t from = 0; from < nodes_.size(); ++from) {
-        graph[from].reserve(nodes_[from].outgoing.size());
-        for (const auto& [to, stat] : nodes_[from].outgoing) {
-            graph[from].push_back(Dijkstra::Edge{
-                to,
-                stat.average_length()
-            });
+    const std::size_t n = nodes_.size();
+    std::vector<uint64_t> dist(n, INF_DISTANCE);
+    dist[source] = 0;
+    pq.emplace(0, source);
+
+    while (!pq.empty()) {
+        const auto [d, u] = pq.top();
+        pq.pop();
+
+        if (d != dist[u]) {
+            continue;
+        }
+
+        if (u == target) {
+            result = d;
+            return true;
+        }
+
+        for (const auto& [v, stat] : nodes_[u].outgoing) {
+            const uint64_t nd = d + stat.average_length();
+            if (nd < dist[v]) {
+                dist[v] = nd;
+                pq.emplace(nd, v);
+            }
         }
     }
 
-    return graph;
+    return false;
 }
 
-bool GraphStore::one_to_one(const Location& origin, const Location& destination, uint64_t& result) const {
+uint64_t GraphStore::dijkstra_one_to_all_locked(uint32_t source) const {
+    using QueueItem = std::pair<uint64_t, uint32_t>;
+    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<>> pq;
+
+    const std::size_t n = nodes_.size();
+    std::vector<uint64_t> dist(n, INF_DISTANCE);
+    dist[source] = 0;
+    pq.emplace(0, source);
+
+    while (!pq.empty()) {
+        const auto [d, u] = pq.top();
+        pq.pop();
+
+        if (d != dist[u]) {
+            continue;
+        }
+
+        for (const auto& [v, stat] : nodes_[u].outgoing) {
+            const uint64_t nd = d + stat.average_length();
+            if (nd < dist[v]) {
+                dist[v] = nd;
+                pq.emplace(nd, v);
+            }
+        }
+    }
+
+    uint64_t total = 0;
+    for (const uint64_t value : dist) {
+        if (value != INF_DISTANCE) {
+            total += value;
+        }
+    }
+
+    return total;
+}
+
+bool GraphStore::one_to_one(const Location& origin,
+                             const Location& destination,
+                             uint64_t& result) const {
     const Point origin_point{origin.x(), origin.y()};
     const Point destination_point{destination.x(), destination.y()};
 
@@ -124,8 +184,7 @@ bool GraphStore::one_to_one(const Location& origin, const Location& destination,
         return false;
     }
 
-    const auto graph = build_graph_snapshot_locked();
-    return Dijkstra::shortest_path(graph, source, target, result);
+    return dijkstra_one_to_one_locked(source, target, result);
 }
 
 bool GraphStore::one_to_all(const Location& origin, uint64_t& result) const {
@@ -138,8 +197,6 @@ bool GraphStore::one_to_all(const Location& origin, uint64_t& result) const {
         return false;
     }
 
-    const auto graph = build_graph_snapshot_locked();
-    result = Dijkstra::sum_of_shortest_paths(graph, source);
-
+    result = dijkstra_one_to_all_locked(source);
     return true;
 }
