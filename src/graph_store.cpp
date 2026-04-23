@@ -99,12 +99,12 @@ bool GraphStore::add_walk(const Walk& walk) {
     return true;
 }
 
-GraphStore::Snapshot GraphStore::build_snapshot_locked() const {
+GraphStore::Snapshot GraphStore::build_snapshot_from(const std::vector<Node>& nodes) {
     Snapshot snap;
-    snap.adj.resize(nodes_.size());
+    snap.adj.resize(nodes.size());
 
-    for (std::size_t i = 0; i < nodes_.size(); ++i) {
-        const auto& edges = nodes_[i].outgoing;
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        const auto& edges = nodes[i].outgoing;
         snap.adj[i].reserve(edges.size());
         for (const auto& e : edges) {
             snap.adj[i].push_back(Snapshot::SnapEdge{e.to, e.average_weight()});
@@ -189,9 +189,9 @@ bool GraphStore::one_to_one(const Location& origin,
     const Point op{origin.x(), origin.y()};
     const Point dp{destination.x(), destination.y()};
 
-    Snapshot snap;
     uint32_t source = 0;
     uint32_t target = 0;
+    std::vector<Node> nodes_copy;
 
     {
         std::shared_lock lock(mutex_);
@@ -203,17 +203,18 @@ bool GraphStore::one_to_one(const Location& origin,
             return false;
         }
 
-        snap = build_snapshot_locked();
+        nodes_copy = nodes_;
     } 
 
+    const Snapshot snap = build_snapshot_from(nodes_copy);
     return dijkstra_one_to_one(snap, source, target, result);
 }
 
 bool GraphStore::one_to_all(const Location& origin, uint64_t& result) const {
     const Point op{origin.x(), origin.y()};
 
-    Snapshot snap;
     uint32_t source = 0;
+    std::vector<Node> nodes_copy;
 
     {
         std::shared_lock lock(mutex_);
@@ -222,9 +223,10 @@ bool GraphStore::one_to_all(const Location& origin, uint64_t& result) const {
             return false;
         }
 
-        snap = build_snapshot_locked();
+        nodes_copy = nodes_;
     } 
 
+    const Snapshot snap = build_snapshot_from(nodes_copy);
     result = dijkstra_one_to_all(snap, source);
     return true;
 }

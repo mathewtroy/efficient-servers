@@ -23,7 +23,7 @@ private:
         uint32_t weight_sum;
         uint32_t sample_count;
 
-        [[nodiscard]] uint32_t average_weight() const {
+        [[nodiscard]] uint32_t average_weight() const noexcept {
             return sample_count == 0 ? 0U : weight_sum / sample_count;
         }
     };
@@ -50,7 +50,7 @@ private:
     static bool points_match(const Point& a, const Point& b);
     static std::pair<int32_t, int32_t> cell_of(const Point& point);
 
-    Snapshot build_snapshot_locked() const;
+    static Snapshot build_snapshot_from(const std::vector<Node>& nodes);
 
     static bool dijkstra_one_to_one(const Snapshot& snap,
                                      uint32_t source, uint32_t target,
