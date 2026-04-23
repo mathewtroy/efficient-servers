@@ -13,20 +13,6 @@ struct Point {
     int32_t y{};
 };
 
-struct EdgeStat {
-    uint64_t length_sum{0};
-    uint32_t sample_count{0};
-
-    [[nodiscard]] uint32_t average_length() const {
-        return sample_count == 0 ? 0U : static_cast<uint32_t>(length_sum / sample_count);
-    }
-
-    void add_sample(uint32_t length) {
-        length_sum += length;
-        ++sample_count;
-    }
-};
-
 struct PairHash {
     template <typename T1, typename T2>
     std::size_t operator()(const std::pair<T1, T2>& value) const noexcept {

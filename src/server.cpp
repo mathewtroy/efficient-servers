@@ -1,5 +1,6 @@
 #include "server.hpp"
 #include "protocol.hpp"
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+
 #include "server.pb.h"
 
 Server::Server(int port) : port_(port) {}

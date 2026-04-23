@@ -15,7 +15,6 @@ bool Protocol::read_exact(int fd, void* buffer, std::size_t size) {
         if (read_count == 0) {
             return false;
         }
-
         if (read_count < 0) {
             if (errno == EINTR) {
                 continue;

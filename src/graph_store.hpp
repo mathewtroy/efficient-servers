@@ -18,9 +18,29 @@ public:
     bool one_to_all(const Location& origin, uint64_t& result) const;
 
 private:
+    struct Edge {
+        uint32_t to;
+        uint32_t weight_sum;
+        uint32_t sample_count;
+
+        [[nodiscard]] uint32_t average_weight() const {
+            return sample_count == 0 ? 0U : weight_sum / sample_count;
+        }
+    };
+
     struct Node {
         Point point;
-        std::unordered_map<uint32_t, EdgeStat> outgoing;
+        std::vector<Edge> outgoing;
+    };
+
+    struct Snapshot {
+        struct SnapEdge {
+            uint32_t to;
+            uint32_t weight; 
+        };
+        std::vector<std::vector<SnapEdge>> adj;
+
+        std::size_t size() const noexcept { return adj.size(); }
     };
 
     uint32_t resolve_or_create_node_locked(const Point& point);
@@ -30,8 +50,12 @@ private:
     static bool points_match(const Point& a, const Point& b);
     static std::pair<int32_t, int32_t> cell_of(const Point& point);
 
-    bool dijkstra_one_to_one_locked(uint32_t source, uint32_t target, uint64_t& result) const;
-    uint64_t dijkstra_one_to_all_locked(uint32_t source) const;
+    Snapshot build_snapshot_locked() const;
+
+    static bool dijkstra_one_to_one(const Snapshot& snap,
+                                     uint32_t source, uint32_t target,
+                                     uint64_t& result);
+    static uint64_t dijkstra_one_to_all(const Snapshot& snap, uint32_t source);
 
     mutable std::shared_mutex mutex_;
     std::vector<Node> nodes_;
