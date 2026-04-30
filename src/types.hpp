@@ -22,6 +22,15 @@ struct PairHash {
     }
 };
 
+struct Int64Hash {
+    std::size_t operator()(int64_t key) const noexcept {
+        uint64_t x = static_cast<uint64_t>(key);
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return static_cast<std::size_t>(x ^ (x >> 31));
+    }
+};
+
 inline int64_t pack_cell_key(int32_t cell_x, int32_t cell_y) {
     return (static_cast<int64_t>(cell_x) << 32) ^
            static_cast<uint32_t>(cell_y);

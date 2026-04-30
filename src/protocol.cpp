@@ -1,30 +1,43 @@
 #include "protocol.hpp"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
-#include <cstddef>
+#include <cstring>
 #include <unistd.h>
 
-bool Protocol::read_exact(int fd, void* buffer, std::size_t size) {
-    auto* ptr = static_cast<uint8_t*>(buffer);
-    std::size_t total = 0;
-
-    while (total < size) {
-        const auto read_count = ::read(fd, ptr + total, size - total);
-
-        if (read_count == 0) {
-            return false;
-        }
-        if (read_count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-
-        total += static_cast<std::size_t>(read_count);
+bool BufferedReader::fill() {
+    const std::size_t remaining = tail_ - head_;
+    if (head_ > 0 && remaining > 0) {
+        std::memmove(buf_.data(), buf_.data() + head_, remaining);
     }
+    tail_ = remaining;
+    head_ = 0;
 
+    const auto n = ::read(fd_, buf_.data() + tail_, buf_.size() - tail_);
+    if (n <= 0) {
+        if (n < 0 && errno == EINTR) return fill();
+        return false;
+    }
+    tail_ += static_cast<std::size_t>(n);
+    return true;
+}
+
+bool BufferedReader::read_exact(void* out, std::size_t size) {
+    auto* ptr = static_cast<uint8_t*>(out);
+    std::size_t done = 0;
+
+    while (done < size) {
+        const std::size_t avail = tail_ - head_;
+        if (avail == 0) {
+            if (!fill()) return false;
+            continue;
+        }
+        const std::size_t take = std::min(avail, size - done);
+        std::memcpy(ptr + done, buf_.data() + head_, take);
+        head_ += take;
+        done  += take;
+    }
     return true;
 }
 
@@ -33,49 +46,36 @@ bool Protocol::write_exact(int fd, const void* buffer, std::size_t size) {
     std::size_t total = 0;
 
     while (total < size) {
-        const auto write_count = ::write(fd, ptr + total, size - total);
-
-        if (write_count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+        const auto n = ::write(fd, ptr + total, size - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
             return false;
         }
-
-        total += static_cast<std::size_t>(write_count);
+        total += static_cast<std::size_t>(n);
     }
-
     return true;
 }
 
-bool Protocol::read_message(int fd, std::vector<uint8_t>& buffer) {
+bool Protocol::read_message(BufferedReader& reader, std::vector<uint8_t>& buffer) {
     uint32_t length_be = 0;
-
-    if (!read_exact(fd, &length_be, sizeof(length_be))) {
-        return false;
-    }
-
+    if (!reader.read_exact(&length_be, sizeof(length_be))) return false;
     const uint32_t length = ntohl(length_be);
     buffer.resize(length);
-
-    if (length == 0) {
-        return true;
-    }
-
-    return read_exact(fd, buffer.data(), length);
+    if (length == 0) return true;
+    return reader.read_exact(buffer.data(), length);
 }
 
-bool Protocol::write_message(int fd, const std::vector<uint8_t>& buffer) {
-    const uint32_t length = static_cast<uint32_t>(buffer.size());
-    const uint32_t length_be = htonl(length);
+bool Protocol::write_message(int fd, const void* data, std::size_t size) {
+    const uint32_t length_be = htonl(static_cast<uint32_t>(size));
 
-    if (!write_exact(fd, &length_be, sizeof(length_be))) {
-        return false;
+    if (size <= 4096) {
+        uint8_t tmp[4100];
+        std::memcpy(tmp, &length_be, 4);
+        if (size > 0) std::memcpy(tmp + 4, data, size);
+        return write_exact(fd, tmp, 4 + size);
     }
 
-    if (length == 0) {
-        return true;
-    }
-
-    return write_exact(fd, buffer.data(), buffer.size());
+    if (!write_exact(fd, &length_be, 4)) return false;
+    if (size == 0) return true;
+    return write_exact(fd, data, size);
 }

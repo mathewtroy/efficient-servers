@@ -11,6 +11,44 @@ if [ ! -x ./build/efficient_servers ]; then
   exit 1
 fi
 
+# ── Portable timed-nc helper ──────────────────────────────────────────────────
+# Returns elapsed seconds (3 decimal places) to stdout; exits with nc's status.
+timed_nc() {
+  local infile="$1" outfile="$2" port="$3"
+  if [[ "$(uname)" == "Linux" ]] && /usr/bin/time -f "%e" true 2>/dev/null; then
+    # Linux with GNU time
+    { /usr/bin/time -f "%e" nc -N localhost "$port" < "$infile" > "$outfile"; } 2>&1 | tail -n 1
+  else
+    # macOS / fallback: measure with Python (ms precision)
+    python3 - "$infile" "$outfile" "$port" <<'PYEOF'
+import sys, socket, time, os
+
+infile, outfile, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(infile, 'rb').read()
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect(('localhost', port))
+
+t0 = time.perf_counter()
+sock.sendall(data)
+sock.shutdown(socket.SHUT_WR)   # signal EOF to server
+
+out = bytearray()
+while True:
+    chunk = sock.recv(65536)
+    if not chunk:
+        break
+    out.extend(chunk)
+sock.close()
+elapsed = time.perf_counter() - t0
+
+open(outfile, 'wb').write(bytes(out))
+print(f'{elapsed:.3f}')
+PYEOF
+  fi
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
 for i in 1 2 3 4 5; do
   pkill -f efficient_servers || true
 
@@ -34,18 +72,15 @@ for i in 1 2 3 4 5; do
     exit 1
   fi
 
-  TIME_OUTPUT=$({ /usr/bin/time -f "%e" nc -N localhost 1234 < ../walk3000.pbf > out.bin; } 2>&1)
+  TIME_VALUE=$(timed_nc ../walk3000.pbf out.bin 1234)
   STATUS=$?
 
   if [ "$STATUS" -ne 0 ]; then
-    echo "nc failed on run $i"
-    echo "$TIME_OUTPUT"
+    echo "nc/client failed on run $i"
     kill $SERVER_PID 2>/dev/null || true
     wait $SERVER_PID 2>/dev/null || true
     exit 1
   fi
-
-  TIME_VALUE=$(echo "$TIME_OUTPUT" | tail -n 1)
 
   echo "run $i: $TIME_VALUE s"
 

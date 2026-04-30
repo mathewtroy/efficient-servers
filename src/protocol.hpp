@@ -4,12 +4,27 @@
 #include <cstdint>
 #include <vector>
 
-class Protocol {
+class BufferedReader {
 public:
-    static bool read_message(int fd, std::vector<uint8_t>& buffer);
-    static bool write_message(int fd, const std::vector<uint8_t>& buffer);
+    explicit BufferedReader(int fd, std::size_t buf_size = 131072)
+        : fd_(fd), buf_(buf_size), head_(0), tail_(0) {}
+
+    bool read_exact(void* out, std::size_t size);
 
 private:
-    static bool read_exact(int fd, void* buffer, std::size_t size);
+    bool fill();
+
+    int fd_;
+    std::vector<uint8_t> buf_;
+    std::size_t head_;
+    std::size_t tail_;
+};
+
+class Protocol {
+public:
+    static bool read_message(BufferedReader& reader, std::vector<uint8_t>& buffer);
+    static bool write_message(int fd, const void* data, std::size_t size);
+
+private:
     static bool write_exact(int fd, const void* buffer, std::size_t size);
 };
