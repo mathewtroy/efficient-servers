@@ -43,6 +43,7 @@ inline uint64_t squared_distance(const Point& a, const Point& b) {
 }
 
 inline int32_t floor_div(int32_t value, int32_t divisor) {
+    if (value >= 0) return value / divisor;
     int32_t result = value / divisor;
     const int32_t remainder = value % divisor;
     if (remainder != 0 && ((remainder > 0) != (divisor > 0))) {
