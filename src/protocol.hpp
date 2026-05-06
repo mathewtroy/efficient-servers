@@ -10,6 +10,9 @@ public:
         : fd_(fd), buf_(buf_size), head_(0), tail_(0) {}
 
     bool read_exact(void* out, std::size_t size);
+    [[nodiscard]] bool has_buffered_data() const {
+        return head_ < tail_;
+    }
 
 private:
     bool fill();
