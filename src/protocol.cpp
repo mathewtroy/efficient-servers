@@ -41,6 +41,36 @@ bool BufferedReader::read_exact(void* out, std::size_t size) {
     return true;
 }
 
+bool BufferedReader::read_exact_to_vector(std::vector<uint8_t>& out, std::size_t size) {
+    out.resize(size);
+    auto* ptr = out.data();
+    std::size_t done = 0;
+
+    while (done < size) {
+        const std::size_t avail = tail_ - head_;
+        if (avail > 0) {
+            const std::size_t take = std::min(avail, size - done);
+            std::memcpy(ptr + done, buf_.data() + head_, take);
+            head_ += take;
+            done += take;
+            continue;
+        }
+
+        if (size - done >= buf_.size() / 2) {
+            const auto n = ::read(fd_, ptr + done, size - done);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                return false;
+            }
+            done += static_cast<std::size_t>(n);
+        } else if (!fill()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool Protocol::write_exact(int fd, const void* buffer, std::size_t size) {
     auto* ptr = static_cast<const uint8_t*>(buffer);
     std::size_t total = 0;
@@ -60,9 +90,11 @@ bool Protocol::read_message(BufferedReader& reader, std::vector<uint8_t>& buffer
     uint32_t length_be = 0;
     if (!reader.read_exact(&length_be, sizeof(length_be))) return false;
     const uint32_t length = ntohl(length_be);
-    buffer.resize(length);
-    if (length == 0) return true;
-    return reader.read_exact(buffer.data(), length);
+    if (length == 0) {
+        buffer.clear();
+        return true;
+    }
+    return reader.read_exact_to_vector(buffer, length);
 }
 
 bool Protocol::write_message(int fd, const void* data, std::size_t size) {
