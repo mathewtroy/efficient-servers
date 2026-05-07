@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+#include <thread>
 
 #ifdef __linux__
 #  include <sys/epoll.h>
@@ -21,7 +23,24 @@
 
 #include "server.pb.h"
 
-Server::Server(int port) : port_(port) {}
+Server::Server(int port) : port_(port) {
+    writer_thread_ = std::thread([this] {
+        writer_loop();
+    });
+}
+
+Server::~Server() {
+    auto task = std::make_unique<WriterTask>();
+    task->kind = WriterTaskKind::Stop;
+    {
+        std::unique_lock lock(writer_mutex_);
+        writer_queue_.push_back(std::move(task));
+    }
+    writer_cv_.notify_one();
+    if (writer_thread_.joinable()) {
+        writer_thread_.join();
+    }
+}
 
 namespace {
 
@@ -149,7 +168,247 @@ void Server::run() {
     ::close(server_fd);
 }
 
+void Server::clear_pending_batch(PendingWalkBatch& pending) {
+    pending.points.clear();
+    pending.lengths.clear();
+    pending.point_offsets.clear();
+    pending.length_offsets.clear();
+    pending.raw_prefix.clear();
+    pending.raw_prefix_bytes = 0;
+    pending.point_offsets.push_back(0);
+    pending.length_offsets.push_back(0);
+}
+
+bool Server::pending_batch_empty(const PendingWalkBatch& pending) {
+    return pending.point_offsets.size() <= 1;
+}
+
+bool Server::same_pending_batch(const PendingWalkBatch& a, const PendingWalkBatch& b) {
+    if (a.point_offsets.size() != b.point_offsets.size() ||
+        a.length_offsets.size() != b.length_offsets.size() ||
+        a.points.size() != b.points.size() ||
+        a.lengths.size() != b.lengths.size()) {
+        return false;
+    }
+
+    return std::memcmp(a.point_offsets.data(),
+                       b.point_offsets.data(),
+                       a.point_offsets.size() * sizeof(uint32_t)) == 0 &&
+           std::memcmp(a.length_offsets.data(),
+                       b.length_offsets.data(),
+                       a.length_offsets.size() * sizeof(uint32_t)) == 0 &&
+           std::memcmp(a.points.data(),
+                       b.points.data(),
+                       a.points.size() * sizeof(Point)) == 0 &&
+           std::memcmp(a.lengths.data(),
+                       b.lengths.data(),
+                       a.lengths.size() * sizeof(uint32_t)) == 0;
+}
+
+bool Server::submit_walk_batch(PendingWalkBatch&& batch) {
+    auto task = std::make_unique<WriterTask>();
+    task->kind = WriterTaskKind::Walk;
+    task->batch = std::move(batch);
+
+    if (active_clients_.load(std::memory_order_acquire) <= 1) {
+        uint64_t generation = 0;
+        {
+            std::unique_lock lock(writer_mutex_);
+            if (writer_queue_.empty() && !writer_busy_) {
+                generation = ++next_generation_;
+                latest_submitted_generation_.store(generation, std::memory_order_release);
+            }
+        }
+        if (generation != 0) {
+            const bool ok = commit_batch_to_graph(task->batch, 1);
+            {
+                std::unique_lock lock(writer_mutex_);
+                committed_generation_ = std::max(committed_generation_, generation);
+            }
+            committed_cv_.notify_all();
+            return ok;
+        }
+    }
+
+    {
+        std::unique_lock lock(writer_mutex_);
+        task->generation = ++next_generation_;
+        latest_submitted_generation_.store(task->generation, std::memory_order_release);
+        writer_queue_.push_back(std::move(task));
+    }
+    writer_cv_.notify_one();
+    return true;
+}
+
+std::future<bool> Server::submit_reset() {
+    auto task = std::make_unique<WriterTask>();
+    task->kind = WriterTaskKind::Reset;
+    task->done = std::make_shared<std::promise<bool>>();
+    auto future = task->done->get_future();
+    {
+        std::unique_lock lock(writer_mutex_);
+        task->generation = ++next_generation_;
+        latest_submitted_generation_.store(task->generation, std::memory_order_release);
+        writer_queue_.push_back(std::move(task));
+    }
+    writer_cv_.notify_one();
+    return future;
+}
+
+void Server::wait_for_generation(uint64_t generation) {
+    std::unique_lock lock(writer_mutex_);
+    committed_cv_.wait(lock, [&] {
+        return committed_generation_ >= generation;
+    });
+}
+
+bool Server::commit_batch_to_graph(PendingWalkBatch& batch, uint32_t repeat_count) {
+    if (pending_batch_empty(batch)) return true;
+    if (graph_store_.add_walks_flat_repeated(batch.points,
+                                             batch.lengths,
+                                             batch.point_offsets,
+                                             batch.length_offsets,
+                                             repeat_count)) {
+        return true;
+    }
+
+    if (batch.raw_prefix.empty()) return false;
+    if (batch.raw_prefix.size() + 1 != batch.point_offsets.size()) return false;
+
+    std::vector<std::vector<Point>> walks_points;
+    std::vector<std::vector<uint32_t>> walks_lengths;
+    walks_points.reserve(batch.raw_prefix.size());
+    walks_lengths.reserve(batch.raw_prefix.size());
+
+    Request raw_request;
+    for (const auto& raw : batch.raw_prefix) {
+        raw_request.Clear();
+        if (!raw_request.ParseFromArray(raw.data(), static_cast<int>(raw.size())) ||
+            raw_request.msg_case() != Request::kWalk ||
+            raw_request.walk().locations_size() < 2 ||
+            raw_request.walk().lengths_size() != raw_request.walk().locations_size() - 1) {
+            return false;
+        }
+
+        auto& points = walks_points.emplace_back();
+        auto& lengths = walks_lengths.emplace_back();
+        points.reserve(static_cast<std::size_t>(raw_request.walk().locations_size()));
+        lengths.reserve(static_cast<std::size_t>(raw_request.walk().lengths_size()));
+
+        for (const auto& loc : raw_request.walk().locations()) {
+            points.push_back(Point{loc.x(), loc.y()});
+        }
+        for (const uint32_t length : raw_request.walk().lengths()) {
+            lengths.push_back(length);
+        }
+    }
+
+    for (uint32_t i = 0; i < repeat_count; ++i) {
+        if (!graph_store_.add_walks(walks_points, walks_lengths)) return false;
+    }
+    return true;
+}
+
+void Server::writer_loop() {
+    std::vector<std::unique_ptr<WriterTask>> tasks;
+    std::vector<uint8_t> consumed;
+    std::vector<uint8_t> fulfilled;
+
+    while (true) {
+        tasks.clear();
+        {
+            std::unique_lock lock(writer_mutex_);
+            writer_cv_.wait(lock, [&] {
+                return !writer_queue_.empty();
+            });
+            if (active_clients_.load(std::memory_order_acquire) > 16 && writer_queue_.size() < 8) {
+                writer_cv_.wait_for(lock, std::chrono::microseconds(250));
+            }
+            while (!writer_queue_.empty()) {
+                tasks.push_back(std::move(writer_queue_.front()));
+                writer_queue_.pop_front();
+            }
+            writer_busy_ = true;
+        }
+
+        std::size_t i = 0;
+        while (i < tasks.size()) {
+            if (tasks[i]->kind == WriterTaskKind::Stop) {
+                if (tasks[i]->done) tasks[i]->done->set_value(true);
+                {
+                    std::unique_lock lock(writer_mutex_);
+                    writer_busy_ = false;
+                }
+                return;
+            }
+
+            if (tasks[i]->kind == WriterTaskKind::Reset) {
+                graph_store_.reset();
+                if (tasks[i]->done) tasks[i]->done->set_value(true);
+                {
+                    std::unique_lock lock(writer_mutex_);
+                    committed_generation_ = std::max(committed_generation_, tasks[i]->generation);
+                }
+                committed_cv_.notify_all();
+                ++i;
+                continue;
+            }
+
+            std::size_t end = i;
+            while (end < tasks.size() && tasks[end]->kind == WriterTaskKind::Walk) {
+                ++end;
+            }
+
+            consumed.assign(end - i, 0);
+            fulfilled.assign(end - i, 0);
+            for (std::size_t a = i; a < end; ++a) {
+                const std::size_t ai = a - i;
+                if (consumed[ai]) continue;
+
+                uint32_t repeat_count = 1;
+                for (std::size_t b = a + 1; b < end; ++b) {
+                    const std::size_t bi = b - i;
+                    if (!consumed[bi] && same_pending_batch(tasks[a]->batch, tasks[b]->batch)) {
+                        consumed[bi] = 1;
+                        ++repeat_count;
+                    }
+                }
+
+                const bool ok = commit_batch_to_graph(tasks[a]->batch, repeat_count);
+                if (!fulfilled[ai] && tasks[a]->done) {
+                    tasks[a]->done->set_value(ok);
+                    fulfilled[ai] = 1;
+                }
+                for (std::size_t b = a + 1; b < end; ++b) {
+                    const std::size_t bi = b - i;
+                    if (consumed[bi] && !fulfilled[bi] && tasks[b]->done) {
+                        tasks[b]->done->set_value(ok);
+                        fulfilled[bi] = 1;
+                    }
+                }
+            }
+
+            uint64_t committed = 0;
+            for (std::size_t a = i; a < end; ++a) {
+                committed = std::max(committed, tasks[a]->generation);
+            }
+            {
+                std::unique_lock lock(writer_mutex_);
+                committed_generation_ = std::max(committed_generation_, committed);
+            }
+            committed_cv_.notify_all();
+            i = end;
+        }
+
+        {
+            std::unique_lock lock(writer_mutex_);
+            writer_busy_ = false;
+        }
+    }
+}
+
 void Server::handle_client(int client_fd) {
+    active_clients_.fetch_add(1, std::memory_order_acq_rel);
     BufferedReader reader(client_fd, 1024 * 1024);
     BufferedWriter writer(client_fd);
     std::vector<uint8_t> input;
@@ -159,45 +418,13 @@ void Server::handle_client(int client_fd) {
     FastRequest fast_request;
     PendingWalkBatch batch;
 
-    {
-        std::unique_lock lock(pending_mutex_);
-        pending_batches_.push_back(&batch);
-    }
-
-    auto flush_all_walks_locked = [&]() -> bool {
-        for (PendingWalkBatch* pending : pending_batches_) {
-            if (pending->point_offsets.size() <= 1) continue;
-
-            if (!graph_store_.add_walks_flat(pending->points,
-                                             pending->lengths,
-                                             pending->point_offsets,
-                                             pending->length_offsets)) {
-                return false;
-            }
-            pending->points.clear();
-            pending->lengths.clear();
-            pending->point_offsets.clear();
-            pending->length_offsets.clear();
-            pending->point_offsets.push_back(0);
-            pending->length_offsets.push_back(0);
-        }
-
-        return true;
-    };
-
-    auto flush_current_walks_locked = [&]() -> bool {
-        if (batch.point_offsets.size() <= 1) return true;
-        const bool ok = graph_store_.add_walks_flat(batch.points,
-                                                    batch.lengths,
-                                                    batch.point_offsets,
-                                                    batch.length_offsets);
-        batch.points.clear();
-        batch.lengths.clear();
-        batch.point_offsets.clear();
-        batch.length_offsets.clear();
-        batch.point_offsets.push_back(0);
-        batch.length_offsets.push_back(0);
-        return ok;
+    auto remember_raw_prefix = [](PendingWalkBatch& pending, const std::vector<uint8_t>& raw) {
+        static constexpr std::size_t MAX_RAW_PREFIX_WALKS = 64;
+        static constexpr std::size_t MAX_RAW_PREFIX_BYTES = 1u << 20u;
+        if (pending.raw_prefix.size() >= MAX_RAW_PREFIX_WALKS) return;
+        if (pending.raw_prefix_bytes + raw.size() > MAX_RAW_PREFIX_BYTES) return;
+        pending.raw_prefix.push_back(raw);
+        pending.raw_prefix_bytes += raw.size();
     };
 
     auto write_response = [&]() -> bool {
@@ -206,20 +433,34 @@ void Server::handle_client(int client_fd) {
         return writer.append(out);
     };
 
+    auto submit_current_batch = [&]() -> bool {
+        if (pending_batch_empty(batch)) return true;
+        const bool ok = submit_walk_batch(std::move(batch));
+        batch = PendingWalkBatch{};
+        return ok;
+    };
+
+    auto wait_until_current = [&]() {
+        const uint64_t generation = latest_submitted_generation_.load(std::memory_order_acquire);
+        if (generation != 0) {
+            wait_for_generation(generation);
+        }
+    };
+
     while (Protocol::read_message(reader, input)) {
-        if (!input.empty() && input[0] == 0x0a) {
+        if (input.size() >= 1024 && input[0] == 0x0a) {
             out.clear();
             const std::size_t point_start = batch.points.size();
             const std::size_t length_start = batch.lengths.size();
             bool parsed = false;
             {
-                std::shared_lock pending_lock(pending_mutex_);
                 parsed = parse_fast_walk_into(input.data(), input.size(), batch.points, batch.lengths);
                 if (parsed &&
                     batch.points.size() - point_start >= 2 &&
                     batch.lengths.size() - length_start == batch.points.size() - point_start - 1) {
                     batch.point_offsets.push_back(static_cast<uint32_t>(batch.points.size()));
                     batch.length_offsets.push_back(static_cast<uint32_t>(batch.lengths.size()));
+                    remember_raw_prefix(batch, input);
                 } else {
                     batch.points.resize(point_start);
                     batch.lengths.resize(length_start);
@@ -230,7 +471,10 @@ void Server::handle_client(int client_fd) {
             if (parsed) {
                 append_empty_ok_frame(out);
                 if (!writer.append(out)) goto close_client;
-                if (!reader.has_buffered_data() && !writer.flush()) goto close_client;
+                if (!reader.has_buffered_data()) {
+                    if (!submit_current_batch()) goto close_client;
+                    if (!writer.flush()) goto close_client;
+                }
                 continue;
             }
         }
@@ -241,16 +485,9 @@ void Server::handle_client(int client_fd) {
 
             switch (fast_request.kind) {
                 case FastKind::Reset: {
-                    std::unique_lock pending_lock(pending_mutex_);
-                    for (PendingWalkBatch* pending : pending_batches_) {
-                        pending->points.clear();
-                        pending->lengths.clear();
-                        pending->point_offsets.clear();
-                        pending->length_offsets.clear();
-                        pending->point_offsets.push_back(0);
-                        pending->length_offsets.push_back(0);
-                    }
-                    graph_store_.reset();
+                    clear_pending_batch(batch);
+                    auto future = submit_reset();
+                    if (!future.get()) goto close_client;
                     append_empty_ok_frame(out);
                     if (!writer.append(out) || !writer.flush()) goto close_client;
                     continue;
@@ -265,32 +502,36 @@ void Server::handle_client(int client_fd) {
                         append_serialized_response_frame(out, response);
                     } else {
                         {
-                            std::shared_lock pending_lock(pending_mutex_);
-                            batch.points.insert(batch.points.end(),
-                                                fast_request.locations.begin(),
-                                                fast_request.locations.end());
-                            batch.lengths.insert(batch.lengths.end(),
-                                                 fast_request.lengths.begin(),
-                                                 fast_request.lengths.end());
+                            const std::size_t point_start = batch.points.size();
+                            const std::size_t length_start = batch.lengths.size();
+                            batch.points.resize(point_start + fast_request.locations.size());
+                            batch.lengths.resize(length_start + fast_request.lengths.size());
+                            std::move(fast_request.locations.begin(),
+                                      fast_request.locations.end(),
+                                      batch.points.begin() + static_cast<std::ptrdiff_t>(point_start));
+                            std::move(fast_request.lengths.begin(),
+                                      fast_request.lengths.end(),
+                                      batch.lengths.begin() + static_cast<std::ptrdiff_t>(length_start));
                             batch.point_offsets.push_back(static_cast<uint32_t>(batch.points.size()));
                             batch.length_offsets.push_back(static_cast<uint32_t>(batch.lengths.size()));
+                            remember_raw_prefix(batch, input);
                         }
 
                         append_empty_ok_frame(out);
                         if (!writer.append(out)) goto close_client;
-                        if (!reader.has_buffered_data() && !writer.flush()) goto close_client;
+                        if (!reader.has_buffered_data()) {
+                            if (!submit_current_batch()) goto close_client;
+                            if (!writer.flush()) goto close_client;
+                        }
                         continue;
                     }
                     break;
 
                 case FastKind::OneToOne: {
-                    std::unique_lock pending_lock(pending_mutex_);
-                    if (!flush_all_walks_locked()) {
-                        response.Clear();
-                        response.set_status(Response::ERROR);
-                        response.set_errmsg("Invalid pending Walk request");
-                        append_serialized_response_frame(out, response);
-                    } else if (graph_store_.one_to_one(
+                    if (!submit_current_batch()) goto close_client;
+                    wait_until_current();
+                    out.clear();
+                    if (graph_store_.one_to_one(
                             fast_request.origin,
                             fast_request.destination,
                             result)) {
@@ -303,13 +544,10 @@ void Server::handle_client(int client_fd) {
                 }
 
                 case FastKind::OneToAll: {
-                    std::unique_lock pending_lock(pending_mutex_);
-                    if (!flush_all_walks_locked()) {
-                        response.Clear();
-                        response.set_status(Response::ERROR);
-                        response.set_errmsg("Invalid pending Walk request");
-                        append_serialized_response_frame(out, response);
-                    } else if (graph_store_.one_to_all(
+                    if (!submit_current_batch()) goto close_client;
+                    wait_until_current();
+                    out.clear();
+                    if (graph_store_.one_to_all(
                             fast_request.origin,
                             result)) {
                         append_uint64_response_frame(out, 4, result);
@@ -350,16 +588,9 @@ void Server::handle_client(int client_fd) {
 
             case Request::kReset:
                 {
-                    std::unique_lock pending_lock(pending_mutex_);
-                    for (PendingWalkBatch* pending : pending_batches_) {
-                        pending->points.clear();
-                        pending->lengths.clear();
-                        pending->point_offsets.clear();
-                        pending->length_offsets.clear();
-                        pending->point_offsets.push_back(0);
-                        pending->length_offsets.push_back(0);
-                    }
-                    graph_store_.reset();
+                    clear_pending_batch(batch);
+                    auto future = submit_reset();
+                    if (!future.get()) goto close_client;
                     if (!write_response() || !writer.flush()) goto close_client;
                 }
                 continue;
@@ -382,32 +613,33 @@ void Server::handle_client(int client_fd) {
                     }
 
                     {
-                        std::shared_lock pending_lock(pending_mutex_);
                         batch.points.insert(batch.points.end(), pts.begin(), pts.end());
                         batch.lengths.insert(batch.lengths.end(), lens.begin(), lens.end());
                         batch.point_offsets.push_back(static_cast<uint32_t>(batch.points.size()));
                         batch.length_offsets.push_back(static_cast<uint32_t>(batch.lengths.size()));
+                        remember_raw_prefix(batch, input);
                     }
                     if (!write_response()) goto close_client;
-                    if (!reader.has_buffered_data() && !writer.flush()) goto close_client;
+                    if (!reader.has_buffered_data()) {
+                        if (!submit_current_batch()) goto close_client;
+                        if (!writer.flush()) goto close_client;
+                    }
                     continue;
                 }
                 break;
             }
 
             case Request::kOneToOne: {
-                std::unique_lock pending_lock(pending_mutex_);
-                if (!flush_all_walks_locked()) {
-                    response.set_status(Response::ERROR);
-                    response.set_errmsg("Invalid pending Walk request");
-                } else {
-                    uint64_t result = 0;
-                    if (graph_store_.one_to_one(
-                        request.onetoone().origin(),
-                        request.onetoone().destination(),
-                        result)) {
-                        response.set_shortest_path_length(result);
-                    }
+                if (!submit_current_batch()) goto close_client;
+                wait_until_current();
+                response.Clear();
+                response.set_status(Response::OK);
+                uint64_t result = 0;
+                if (graph_store_.one_to_one(
+                    request.onetoone().origin(),
+                    request.onetoone().destination(),
+                    result)) {
+                    response.set_shortest_path_length(result);
                 }
                 if (!write_response()) goto close_client;
                 if (!writer.flush()) goto close_client;
@@ -415,17 +647,15 @@ void Server::handle_client(int client_fd) {
             }
 
             case Request::kOneToAll: {
-                std::unique_lock pending_lock(pending_mutex_);
-                if (!flush_all_walks_locked()) {
-                    response.set_status(Response::ERROR);
-                    response.set_errmsg("Invalid pending Walk request");
-                } else {
-                    uint64_t result = 0;
-                    if (graph_store_.one_to_all(
-                        request.onetoall().origin(),
-                        result)) {
-                        response.set_total_length(result);
-                    }
+                if (!submit_current_batch()) goto close_client;
+                wait_until_current();
+                response.Clear();
+                response.set_status(Response::OK);
+                uint64_t result = 0;
+                if (graph_store_.one_to_all(
+                    request.onetoall().origin(),
+                    result)) {
+                    response.set_total_length(result);
                 }
                 if (!write_response()) goto close_client;
                 if (!writer.flush()) goto close_client;
@@ -444,13 +674,7 @@ void Server::handle_client(int client_fd) {
 
 close_client:
     writer.flush();
-    {
-        std::unique_lock pending_lock(pending_mutex_);
-        flush_current_walks_locked();
-        const auto it = std::find(pending_batches_.begin(), pending_batches_.end(), &batch);
-        if (it != pending_batches_.end()) {
-            pending_batches_.erase(it);
-        }
-    }
+    submit_current_batch();
+    active_clients_.fetch_sub(1, std::memory_order_acq_rel);
     ::close(client_fd);
 }
