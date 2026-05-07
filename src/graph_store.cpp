@@ -27,6 +27,7 @@ void GraphStore::reset() {
     edge_pool_.reserve(2 << 20);
     grid_.clear_and_reserve(1 << 18);
     snapshot_ = std::make_shared<Snapshot>();
+    reverse_pos_scratch_.clear();
     snapshot_dirty_ = false;
 }
 
@@ -146,7 +147,12 @@ std::shared_ptr<const GraphStore::Snapshot> GraphStore::snapshot_for_query() con
 }
 
 void GraphStore::rebuild_snapshot_locked() const {
-    auto snapshot = std::make_shared<Snapshot>();
+    std::shared_ptr<Snapshot> snapshot;
+    if (snapshot_ && snapshot_.use_count() == 1) {
+        snapshot = std::const_pointer_cast<Snapshot>(snapshot_);
+    } else {
+        snapshot = std::make_shared<Snapshot>();
+    }
     const uint32_t n = static_cast<uint32_t>(nodes_.size());
     uint32_t edge_count = 0;
 
@@ -172,7 +178,7 @@ void GraphStore::rebuild_snapshot_locked() const {
         snapshot->reverse_row_start[i] += snapshot->reverse_row_start[i - 1];
     }
 
-    std::vector<uint32_t> reverse_pos = snapshot->reverse_row_start;
+    reverse_pos_scratch_ = snapshot->reverse_row_start;
     for (uint32_t u = 0; u < n; ++u) {
         uint32_t out = snapshot->row_start[u];
         const Edge* edges = edge_pool_.data() + nodes_[u].edge_start;
@@ -180,7 +186,7 @@ void GraphStore::rebuild_snapshot_locked() const {
             const uint32_t v = edges[j].to;
             const uint32_t w = edges[j].average_weight();
             snapshot->edges[out++] = CsrEdge{v, w};
-            snapshot->reverse_edges[reverse_pos[v]++] = CsrEdge{u, w};
+            snapshot->reverse_edges[reverse_pos_scratch_[v]++] = CsrEdge{u, w};
         }
     }
 
@@ -277,6 +283,15 @@ bool GraphStore::add_walks_flat(std::span<const Point> points,
                                 std::span<const uint32_t> lengths,
                                 std::span<const uint32_t> point_offsets,
                                 std::span<const uint32_t> length_offsets) {
+    return add_walks_flat_repeated(points, lengths, point_offsets, length_offsets, 1);
+}
+
+bool GraphStore::add_walks_flat_repeated(std::span<const Point> points,
+                                         std::span<const uint32_t> lengths,
+                                         std::span<const uint32_t> point_offsets,
+                                         std::span<const uint32_t> length_offsets,
+                                         uint32_t repeat_count) {
+    if (repeat_count == 0) return true;
     if (point_offsets.size() != length_offsets.size()) return false;
     if (point_offsets.size() < 2) return true;
     if (point_offsets.front() != 0 || length_offsets.front() != 0) return false;
@@ -307,7 +322,7 @@ bool GraphStore::add_walks_flat(std::span<const Point> points,
         const uint32_t l0 = length_offsets[w];
 
         for (uint32_t i = p0; i + 1 < p1; ++i) {
-            add_edge_locked(node_ids[i], node_ids[i + 1], lengths[l0 + i - p0]);
+            add_edge_locked(node_ids[i], node_ids[i + 1], lengths[l0 + i - p0], repeat_count);
         }
     }
 

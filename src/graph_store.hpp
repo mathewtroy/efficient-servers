@@ -26,6 +26,11 @@ public:
                         std::span<const uint32_t> lengths,
                         std::span<const uint32_t> point_offsets,
                         std::span<const uint32_t> length_offsets);
+    bool add_walks_flat_repeated(std::span<const Point> points,
+                                 std::span<const uint32_t> lengths,
+                                 std::span<const uint32_t> point_offsets,
+                                 std::span<const uint32_t> length_offsets,
+                                 uint32_t repeat_count);
 
     bool one_to_one(const Location& origin, const Location& destination, uint64_t& result) const;
     bool one_to_one(const Point& origin, const Point& destination, uint64_t& result) const;
@@ -94,4 +99,5 @@ private:
     FlatGrid          grid_;
     mutable bool snapshot_dirty_ = false;
     mutable std::shared_ptr<const Snapshot> snapshot_;
+    mutable std::vector<uint32_t> reverse_pos_scratch_;
 };
