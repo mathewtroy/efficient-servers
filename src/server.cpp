@@ -471,10 +471,6 @@ void Server::handle_client(int client_fd) {
             if (parsed) {
                 append_empty_ok_frame(out);
                 if (!writer.append(out)) goto close_client;
-                if (!reader.has_buffered_data()) {
-                    if (!submit_current_batch()) goto close_client;
-                    if (!writer.flush()) goto close_client;
-                }
                 continue;
             }
         }
@@ -519,10 +515,6 @@ void Server::handle_client(int client_fd) {
 
                         append_empty_ok_frame(out);
                         if (!writer.append(out)) goto close_client;
-                        if (!reader.has_buffered_data()) {
-                            if (!submit_current_batch()) goto close_client;
-                            if (!writer.flush()) goto close_client;
-                        }
                         continue;
                     }
                     break;
@@ -620,10 +612,6 @@ void Server::handle_client(int client_fd) {
                         remember_raw_prefix(batch, input);
                     }
                     if (!write_response()) goto close_client;
-                    if (!reader.has_buffered_data()) {
-                        if (!submit_current_batch()) goto close_client;
-                        if (!writer.flush()) goto close_client;
-                    }
                     continue;
                 }
                 break;
